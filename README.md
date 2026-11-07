@@ -61,14 +61,27 @@ trigram rankings with RRF, then ACT-R re-ranks and truncates to `max_results`. S
 - PostgreSQL >= 13 (>= 14 recommended) with the `pgvector` (>= 0.5.0) and `pg_trgm` extensions.
 - [Ollama](https://ollama.com) running locally with an embedding model pulled:
   `ollama pull nomic-embed-text`.
-- Python 3.10+ (the project uses a `venv`).
+- Python 3.11+ (the project uses a `venv`). The lock file is resolved on 3.11.
+
+### Dependencies
+
+`requirements.in` lists the direct dependencies with version ranges. `requirements.txt` is the
+generated lock file (exact versions plus hashes) that both Debian and Termux install from. To
+change a dependency, edit `requirements.in` and regenerate the lock with
+[pip-tools](https://pip-tools.readthedocs.io):
+
+```sh
+pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements.txt requirements.in
+```
+
+Commit both files together, then run the install command below on each machine.
 
 ## Setup
 
 ```sh
 # 1. Python dependencies
 python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
+./venv/bin/pip install --require-hashes -r requirements.txt
 
 # 2. Configure
 cp .env.example .env

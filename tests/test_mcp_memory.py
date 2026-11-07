@@ -12,6 +12,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import mcp_memory  # noqa: E402
@@ -123,6 +126,31 @@ class ResolvePythonTest(unittest.TestCase):
 
     def test_falls_back_to_current_interpreter(self):
         self.assertEqual(resolve_python({}, self.repo_dir), sys.executable)
+
+
+def _fake_server():
+    fake = MCPServer("fake")
+
+    @fake.tool()
+    def ok() -> str:
+        return "fine"
+
+    @fake.tool()
+    def fails() -> str:
+        raise ToolError("expected failure")
+
+    return fake
+
+
+class CallToolTest(unittest.IsolatedAsyncioTestCase):
+    """call_tool against an in-process server: is_error must raise, success must return text."""
+
+    async def test_success_returns_text(self):
+        self.assertEqual(await mcp_memory.call_tool(_fake_server(), "ok", {}), "fine")
+
+    async def test_tool_error_raises(self):
+        with self.assertRaisesRegex(mcp_memory.ToolCallError, "expected failure"):
+            await mcp_memory.call_tool(_fake_server(), "fails", {})
 
 
 class MainTest(unittest.TestCase):
