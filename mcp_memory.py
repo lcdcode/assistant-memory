@@ -19,8 +19,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from mcp import StdioServerParameters, stdio_client
-from mcp.client.session import ClientSession
+from mcp import Client, StdioServerParameters
 from mcp.client.stdio import get_default_environment
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -156,19 +155,26 @@ def resolve_python(environ=None, repo_dir=REPO_DIR):
     return sys.executable
 
 
-async def call_tool(tool_name, arguments):
-    server_params = StdioServerParameters(
-        command=resolve_python(), args=[str(SERVER_PATH)], env=get_default_environment(),
-    )
-    async with stdio_client(server_params) as (read_stream, write_stream):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, arguments)
-
+def result_text(result):
+    """Join the text blocks of a CallToolResult; raise ToolCallError if it reports an error."""
     text = "\n".join(block.text for block in result.content if getattr(block, "text", None))
-    if result.isError:
-        raise ToolCallError(f"{tool_name} failed: {text}")
+    if result.is_error:
+        raise ToolCallError(text)
     return text
+
+
+async def call_tool(server, tool_name, arguments):
+    """Call one tool. `server` is anything mcp.Client accepts (stdio params, or an MCPServer)."""
+    async with Client(server) as client:
+        result = await client.call_tool(tool_name, arguments)
+    # Raised outside the Client context: anyio would wrap it in an ExceptionGroup.
+    return result_text(result)
+
+
+def stdio_server_params(python):
+    return StdioServerParameters(
+        command=python, args=[str(SERVER_PATH)], env=get_default_environment(),
+    )
 
 
 def main(argv):
@@ -184,10 +190,12 @@ def main(argv):
         print(f"mcp_memory: {e}", file=sys.stderr)
         return EXIT_USAGE
 
+    tool_name = COMMANDS[command].tool_name
     try:
-        output = asyncio.run(call_tool(COMMANDS[command].tool_name, arguments))
+        output = asyncio.run(call_tool(stdio_server_params(python), tool_name, arguments))
     except ToolCallError as e:
-        print(f"mcp_memory: {e} (server interpreter: {python})", file=sys.stderr)
+        message = f"mcp_memory: {e} (server interpreter: {python})"
+        print(message, file=sys.stderr)
         return EXIT_TOOL_ERROR
 
     print(output)

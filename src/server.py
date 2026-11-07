@@ -5,12 +5,13 @@ import logging
 import os
 import sys
 from uuid import UUID
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import asyncpg
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from urllib.parse import urlparse
 
 from actr_scoring import ACTRConfig, score_and_rank_memories
@@ -81,7 +82,31 @@ async def lifespan(server):
             pool = None
 
 
-mcp = FastMCP("assistant-memory", lifespan=lifespan)
+mcp = MCPServer("assistant-memory", lifespan=lifespan)
+
+MAX_CONTENT_CHARS = 50000
+
+# Failures of Postgres or Ollama that the caller can act on. OSError covers refused
+# connections and timeouts; anything else is a bug and propagates to the framework.
+BACKEND_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, httpx.HTTPError, OSError)
+
+
+@contextmanager
+def backend_errors(action: str):
+    """Report expected backend failures as tool errors (is_error=True) instead of crashing."""
+    try:
+        yield
+    except BACKEND_ERRORS as e:
+        logger.warning("%s failed: %r", action, e)
+        # The framework prefixes "Error executing tool <name>:", so the action isn't repeated.
+        raise ToolError(f"{type(e).__name__}: {e}") from e
+
+
+def require_valid_category(category: str) -> None:
+    if category not in VALID_CATEGORIES:
+        raise ToolError(
+            f"Invalid category '{category}'. Must be one of: {', '.join(sorted(VALID_CATEGORIES))}"
+        )
 
 
 async def get_embedding(text: str) -> list[float]:
@@ -91,7 +116,13 @@ async def get_embedding(text: str) -> list[float]:
             json={"model": EMBEDDING_MODEL, "prompt": text},
         )
         response.raise_for_status()
-        return response.json()["embedding"]
+        embedding = response.json().get("embedding")
+    if not embedding:
+        raise ToolError(
+            f"Ollama returned no embedding for model '{EMBEDDING_MODEL}' at {OLLAMA_HOST}. "
+            f"Is the model pulled (ollama pull {EMBEDDING_MODEL})?"
+        )
+    return embedding
 
 
 def format_embedding(embedding: list[float]) -> str:
@@ -102,10 +133,10 @@ def format_embedding(embedding: list[float]) -> str:
 async def store_memory(
     content: str,
     category: str,
-    summary: str = None,
-    tags: list[str] = None,
+    summary: str | None = None,
+    tags: list[str] | None = None,
     importance: float = 0.5,
-    project: str = None,
+    project: str | None = None,
 ) -> str:
     """Store a memory (learning, pattern, decision, error fix, etc).
 
@@ -117,13 +148,12 @@ async def store_memory(
         importance: Score 0.0-1.0
         project: Project context (optional)
     """
-    if category not in VALID_CATEGORIES:
-        return f"Invalid category '{category}'. Must be one of: {', '.join(sorted(VALID_CATEGORIES))}"
+    require_valid_category(category)
     importance = max(0.0, min(1.0, importance))
-    if len(content) > 50000:
-        return "Content too long (max 50000 characters)."
+    if len(content) > MAX_CONTENT_CHARS:
+        raise ToolError(f"Content too long ({len(content)} chars, max {MAX_CONTENT_CHARS}).")
 
-    try:
+    with backend_errors("store_memory"):
         embedding = await get_embedding(content)
         if not summary:
             summary = content[:150] + "..." if len(content) > 150 else content
@@ -138,19 +168,16 @@ async def store_memory(
             """, content, summary, category, tags or [], format_embedding(embedding), importance, project, USER_ID)
 
         return f"Memory stored with ID: {result['id']}"
-    except Exception as e:
-        logger.error(f"store_memory failed: {e}", exc_info=True)
-        return f"Error storing memory: {e}"
 
 
 @mcp.tool()
 async def retrieve_memories(
     query: str,
     max_results: int = 5,
-    category: str = None,
+    category: str | None = None,
     min_similarity: float = 0.3,
-    tags: list[str] = None,
-    project: str = None,
+    tags: list[str] | None = None,
+    project: str | None = None,
     include_forgotten: bool = False,
     show_ids: bool = False,
 ) -> str:
@@ -170,7 +197,7 @@ async def retrieve_memories(
     max_results = max(1, min(100, max_results))
     min_similarity = max(0.0, min(1.0, min_similarity))
 
-    try:
+    with backend_errors("retrieve_memories"):
         query_embedding = await get_embedding(query)
         embedding_str = format_embedding(query_embedding)
 
@@ -195,7 +222,7 @@ async def retrieve_memories(
             trgm_rows = []
             try:
                 trgm_rows = await conn.fetch(trgm_sql, *trgm_params)
-            except Exception as trgm_err:
+            except asyncpg.PostgresError as trgm_err:
                 logger.warning(f"Trigram search unavailable: {trgm_err}")
 
             vec_dicts = [dict(r) for r in vec_rows]
@@ -267,17 +294,13 @@ Tags: {', '.join(row['tags']) if row['tags'] else 'none'}{project_info}{id_info}
 
         return f"## {len(final_rows)} memory(ies) found:\n" + "\n".join(results)
 
-    except Exception as e:
-        logger.error(f"retrieve_memories failed: {e}", exc_info=True)
-        return f"Error retrieving memories: {e}"
-
 
 @mcp.tool()
 async def list_memories(
     limit: int = 20,
-    category: str = None,
-    tags: list[str] = None,
-    project: str = None,
+    category: str | None = None,
+    tags: list[str] | None = None,
+    project: str | None = None,
     show_ids: bool = False,
 ) -> str:
     """List recent memories.
@@ -291,10 +314,10 @@ async def list_memories(
             when you need a handle to pass to delete_memory.
     """
     limit = max(1, min(100, limit))
-    if category and category not in VALID_CATEGORIES:
-        return f"Invalid category '{category}'. Must be one of: {', '.join(sorted(VALID_CATEGORIES))}"
+    if category:
+        require_valid_category(category)
 
-    try:
+    with backend_errors("list_memories"):
         db = await get_pool()
         async with db.acquire() as conn:
             conditions = ["(user_id = $1 OR user_id IS NULL)"]
@@ -341,10 +364,6 @@ async def list_memories(
 
         return f"## {len(rows)} memory(ies):\n" + "\n".join(results)
 
-    except Exception as e:
-        logger.error(f"list_memories failed: {e}", exc_info=True)
-        return f"Error listing memories: {e}"
-
 
 @mcp.tool()
 async def delete_memory(memory_id: str) -> str:
@@ -355,28 +374,25 @@ async def delete_memory(memory_id: str) -> str:
     """
     try:
         parsed_id = UUID(memory_id)
-    except (ValueError, AttributeError):
-        return "Invalid memory ID format. Must be a valid UUID."
+    except (ValueError, AttributeError) as e:
+        raise ToolError(f"Invalid memory ID '{memory_id}'. Must be a valid UUID.") from e
 
-    try:
+    with backend_errors("delete_memory"):
         db = await get_pool()
         async with db.acquire() as conn:
             result = await conn.execute(
                 "DELETE FROM memories WHERE id = $1 AND (user_id = $2 OR user_id IS NULL)",
                 parsed_id, USER_ID,
             )
-        if result == "DELETE 1":
-            return f"Memory {memory_id} deleted."
-        return f"Memory {memory_id} not found."
-    except Exception as e:
-        logger.error(f"delete_memory failed: {e}", exc_info=True)
-        return f"Error deleting memory: {e}"
+    if result != "DELETE 1":
+        raise ToolError(f"Memory {memory_id} not found.")
+    return f"Memory {memory_id} deleted."
 
 
 @mcp.tool()
 async def memory_stats() -> str:
     """Show memory database statistics including ACT-R status breakdown."""
-    try:
+    with backend_errors("memory_stats"):
         db = await get_pool()
         async with db.acquire() as conn:
             uf = "(user_id = $1 OR user_id IS NULL)"
@@ -429,10 +445,6 @@ async def memory_stats() -> str:
 
         return stats
 
-    except Exception as e:
-        logger.error(f"memory_stats failed: {e}", exc_info=True)
-        return f"Error getting stats: {e}"
-
 
 @mcp.tool()
 async def memory_forgetting_cycle() -> str:
@@ -442,13 +454,9 @@ async def memory_forgetting_cycle() -> str:
     active (A>0), dormant (-2<A<=0), forgotten (A<=-2).
     Forgotten memories remain in database but are excluded from default results.
     """
-    try:
+    with backend_errors("memory_forgetting_cycle"):
         db = await get_pool()
-        result = await run_forgetting_cycle(db, actr_config)
-        return result
-    except Exception as e:
-        logger.error(f"forgetting_cycle failed: {e}", exc_info=True)
-        return f"Error running forgetting cycle: {e}"
+        return await run_forgetting_cycle(db, actr_config)
 
 
 if __name__ == "__main__":
