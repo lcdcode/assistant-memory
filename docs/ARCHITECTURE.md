@@ -20,7 +20,7 @@ Three local components cooperate:
 | Component | Role | Where |
 | --- | --- | --- |
 | **Ollama** | Turns text into a 768-dim embedding vector (`nomic-embed-text`) | `127.0.0.1:11434` |
-| **PostgreSQL + pgvector + pg_trgm** | Stores memories and runs vector/trigram search | `127.0.0.1:5432` |
+| **PostgreSQL + pgvector + pg_trgm** | Stores memories and runs vector/trigram search | Unix socket (or `127.0.0.1:5432`) |
 | **Python MCP server** | Orchestrates embedding, search, fusion, and re-ranking | `src/*.py` |
 
 The defining design choice is the **retrieval pipeline**. A naive memory store would do one
@@ -457,9 +457,9 @@ queries by `user_id` (matching `USER_ID` from `.env`, or NULL legacy rows).
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `PG_HOST` / `PG_PORT` | `127.0.0.1` / `5432` | PostgreSQL connection |
+| `PG_HOST` / `PG_PORT` | `localhost` / `5432` | Unix socket directory (recommended) or TCP host |
 | `PG_DATABASE` | `assistant_memory` | Target database |
-| `PG_USER` / `PG_PASSWORD` | - | Credentials (empty under trust/peer auth) |
+| `PG_USER` / `PG_PASSWORD` | - | Credentials (password empty under socket `peer` auth) |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Embedding endpoint (localhost enforced) |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Must produce 768-dim vectors to match schema |
 | `USER_ID` | `default` | Owner tag for stored/retrieved memories |
