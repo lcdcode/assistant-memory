@@ -85,7 +85,7 @@ python3 -m venv venv
 
 # 2. Configure
 cp .env.example .env
-# edit .env: set PG_USER and USER_ID at minimum
+# edit .env: set PG_HOST, PG_USER and USER_ID at minimum (see Authentication below)
 
 # 3. Pull the embedding model
 ollama pull nomic-embed-text
@@ -99,41 +99,62 @@ scripts/init_db.sh
 On a clean PostgreSQL install, `scripts/init_db.sh` trips over two things before it can
 apply the schema. Both are one-time host setup, not bugs in the script.
 
-#### 1. Authentication (the password prompt)
+#### 1. Authentication: connect over the Unix socket
 
-The script connects over TCP (`-h 127.0.0.1`), so PostgreSQL authenticates it using the
-`host` rules in `pg_hba.conf` - which on a fresh install demand a password
-(`scram-sha-256`), even if you never set one. A fresh cluster also only ships the
-`postgres` superuser, so the role the script wants (`PG_USER`, defaulting to your login
-name) does not exist yet.
+Point `PG_HOST` at PostgreSQL's Unix socket directory instead of `127.0.0.1`. Socket
+connections are checked against the `local` rules in `pg_hba.conf`, which on Debian default
+to `peer`: your OS login is the credential, so no password and no `pg_hba.conf` edit.
 
-For a single-user dev box, create your role and switch localhost TCP to `trust`. DON'T do this on a shared machine or unsecured laptop:
+| Platform | Socket directory (`PG_HOST`) |
+| --- | --- |
+| Debian / Ubuntu | `/var/run/postgresql` |
+| Termux | `/data/data/com.termux/files/usr/tmp` (`$PREFIX/tmp`) |
+
+A fresh cluster only ships the `postgres` superuser, so create a role named after your
+login (`peer` matches the two):
 
 ```sh
-# Create a login role with DB-creation rights (matches PG_USER default of $(whoami))
 sudo -u postgres createuser --createdb --login "$(whoami)"
-
-# Find pg_hba.conf
-sudo -u postgres psql -tAc 'SHOW hba_file;'
 ```
 
-Edit that file and change the method (last column) on the two localhost `host` lines from
-`scram-sha-256` (or `md5`) to `trust`, then reload:
+Then set `PG_HOST` and `PG_USER` in `.env` and leave `PG_PASSWORD` empty.
+
+If you need TCP (`PG_HOST=127.0.0.1`), keep the default `scram-sha-256` method on the
+`host` lines, give your role a password (`\password` in `psql`), and set `PG_PASSWORD` in
+`.env`. Do not switch the `host` lines to `trust`: anything that can reach the port can then
+connect as any role, superuser included, with no credentials.
+
+#### Termux / Android: turn off TCP
+
+`initdb` without `--auth` (as on Termux) sets every `pg_hba.conf` line to `trust`, and
+PostgreSQL listens on `localhost` by default. On Android, localhost is not private: the
+loopback interface is shared by every app on the device, so any installed app with the
+`INTERNET` permission can connect to `127.0.0.1:5432`. Under `trust` it logs in as your
+role - the cluster superuser on Termux - and can read every memory and run shell commands
+as your Termux user (`COPY ... TO PROGRAM`).
+
+The socket lives in Termux's private `$PREFIX/tmp`, which other apps cannot enter. Disable
+TCP in `$PGDATA/postgresql.conf`:
 
 ```
-host    all    all    127.0.0.1/32    trust
-host    all    all    ::1/128         trust
+listen_addresses = ''
+unix_socket_permissions = 0700
 ```
+
+As a second layer, change the method on the `host` lines in `$PGDATA/pg_hba.conf` from
+`trust` to `reject`. Then restart and set the socket directory in `.env`:
 
 ```sh
-sudo systemctl reload postgresql   # or: sudo -u postgres pg_ctl reload
+pg_ctl -D "$PGDATA" restart
+# .env: PG_HOST=/data/data/com.termux/files/usr/tmp
 ```
 
-Then set `PG_USER` in `.env` to that role and leave `PG_PASSWORD` empty.
+The `local` lines can stay `trust`: only processes running as your Termux user can reach
+the socket, and those can already read `$PGDATA` directly.
 
-> `trust` means any local account can connect as any role with no credentials. Fine for a
-> personal dev machine; on a shared or exposed host, keep password auth and set
-> `PG_PASSWORD` in `.env` instead.
+> Ollama has the same exposure on `127.0.0.1:11434` and cannot listen on a Unix socket. It
+> holds no memories, but any app on the device can use it to run models or to pull and
+> delete them.
 
 #### 2. The `vector` extension needs a superuser
 
@@ -168,9 +189,9 @@ everything itself: `sudo -u postgres psql -c 'ALTER ROLE "<user>" SUPERUSER;'`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PG_HOST` / `PG_PORT` | `127.0.0.1` / `5432` | PostgreSQL connection. |
+| `PG_HOST` / `PG_PORT` | `localhost` / `5432` | Unix socket directory (recommended) or TCP host. |
 | `PG_DATABASE` | `assistant_memory` | Target database. |
-| `PG_USER` / `PG_PASSWORD` | - | DB credentials (peer/trust auth leaves these empty). |
+| `PG_USER` / `PG_PASSWORD` | - | DB credentials (socket `peer` auth leaves the password empty). |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama endpoint (localhost-only, enforced). |
 | `EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model; 768-dim must match the schema. |
 | `USER_ID` | `default` | Owner tag for stored/retrieved memories. |
