@@ -7,6 +7,9 @@
 secrets/
 .secrets/
 
+# --- Ollama logs ---
+ollama.log
+
 __pycache__/
 *.py[cod]
 *$py.class
